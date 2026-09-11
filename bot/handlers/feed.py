@@ -55,7 +55,7 @@ AWAITING_COMMENT_ADJUST = "awaiting_comment_adjust"
 _BROWSE_ACTIONS = {
     "keep": ("🔖 Kept for later", lambda store, urn: store.keep(urn)),
     "skip": ("⏭️ Skipped", None),
-    "notrelevant": ("🙈 Won't be shown again", lambda store, urn: store.ignore(urn)),
+    "notrelevant": ("🗑️ Dismissed — won't show again", lambda store, urn: store.ignore(urn)),
 }
 
 
@@ -135,7 +135,7 @@ def _browse_keyboard(post: dict) -> InlineKeyboardMarkup:
         InlineKeyboardButton("💬 Comment", callback_data="browse:comment"),
         InlineKeyboardButton("🔖 Keep", callback_data="browse:keep"),
         InlineKeyboardButton("⏭️ Skip", callback_data="browse:skip"),
-        InlineKeyboardButton("🚫 Not relevant", callback_data="browse:notrelevant"),
+        InlineKeyboardButton("🗑️ Dismiss", callback_data="browse:notrelevant"),
     ])
     return InlineKeyboardMarkup(rows)
 

@@ -476,7 +476,10 @@ def _resolve_post_url(page, componentkey: str) -> str:
 
     Scoped via the post's own `componentkey` (XPath `preceding::` from that
     exact element) rather than matching on author name, so two posts by the
-    same author can't resolve to each other's link.
+    same author can't resolve to each other's link. Returns "" (never a
+    wrong link) when a fresh toast doesn't show up in time — see the
+    baseline/poll-for-change logic below for why a naive "read whatever toast
+    link exists" check isn't safe.
     """
     if not componentkey:
         return ""
@@ -496,6 +499,18 @@ def _resolve_post_url(page, componentkey: str) -> str:
         menu_btn.click(timeout=5000)
 
         copy_item = page.locator(_COPY_LINK_LOCATOR).first
+        # Capture whatever toast link is on screen BEFORE clicking — the
+        # toast is a reused element that doesn't always swap in its new
+        # content synchronously with the click, so a plain "does a toast
+        # link exist now" check can return the PREVIOUS post's href even
+        # after a click that otherwise succeeded (confirmed live: still
+        # stale after an extra 1.5s wait). Below, we poll for the href to
+        # actually CHANGE from this baseline instead of just being present.
+        try:
+            baseline_href = page.locator(_TOAST_VIEW_POST_LOCATOR).first.get_attribute("href", timeout=200)
+        except Exception:
+            baseline_href = None
+
         try:
             # Auto-waits/polls for the item to render and become clickable,
             # instead of a fixed sleep + one-shot count() check that can race
@@ -507,11 +522,18 @@ def _resolve_post_url(page, componentkey: str) -> str:
             logger.debug("resolve_url[%s]: no copy-link item (%.2fs)", key, time.monotonic() - t0)
             return ""
 
-        toast_link = page.locator(_TOAST_VIEW_POST_LOCATOR).first
-        try:
-            href = toast_link.get_attribute("href", timeout=1500)
-        except Exception:
-            href = None
+        href = None
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                candidate = page.locator(_TOAST_VIEW_POST_LOCATOR).first.get_attribute("href", timeout=200)
+            except Exception:
+                candidate = None
+            if candidate and candidate != baseline_href:
+                href = candidate
+                break
+            page.wait_for_timeout(150)
+
         page.keyboard.press("Escape")
         page.wait_for_timeout(200)
 
