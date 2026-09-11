@@ -19,7 +19,7 @@ Two cooperating systems share this repo:
 - FastAPI + Uvicorn, Pydantic-settings + python-dotenv
 - `scrapling[all]>=0.4.8` (StealthyFetcher with Patchright/Chromium)
 - `mcp>=2.0.0` (MCPServer — MCP server for Claude Code integration)
-- `python-telegram-bot>=20.0` (async, long-polling)
+- `python-telegram-bot[job-queue]>=20.0` (async, long-polling; the `job-queue` extra pulls in APScheduler — required for the bot's "Remind in 1h" comment reminder, see `bot/handlers/feed.py`)
 - `pytest>=8.0.0` (integration smoke tests)
 - No Docker
 
@@ -42,6 +42,7 @@ python scrape.py --attempts 1 --keywords "QA,pytest" --min-score 2 --json
 # Telegram bot (Decker) — two equivalent entry points:
 python telegram_bot.py               # thin shim, delegates to bot.main
 python -m bot.main                   # canonical form
+tail -f logs/bot.log                 # watch Decker's logs (scan progress, errors, ...) live
 
 # MCP server (stdio, spawned automatically by Claude Code via .mcp.json)
 python mcp_server.py
@@ -75,6 +76,8 @@ bot/                 # Decker — the Telegram bot
   formatting.py      # shared helpers (format_age, etc.) for Telegram message rendering
   relevance.py       # LLM-based scoring: calls `claude -p` as a subprocess to judge posts
                      #   ↳ distinct from app/scorer.py which is pure keyword matching
+  comment.py         # LLM-based comment drafting: calls `claude -p` for 3 angled variants
+                     #   (generate + regenerate + free-text adjust), same subprocess approach as relevance.py
   handlers/
     __init__.py      # register_handlers() — wires all CommandHandler / CallbackQueryHandler
     start.py         # /start → main menu keyboard
@@ -98,6 +101,7 @@ bot_posts.json       # bot-side persisted posts with triage state (git-ignored)
 bot_settings.json    # bot-side interests config (git-ignored)
 config_override.json # runtime config overrides (git-ignored, written by PUT /config/interests)
 .env                 # copy from .env.example (git-ignored)
+logs/bot.log          # Decker's rotating log file (git-ignored, created automatically — see bot/main.py)
 ```
 
 ## Architecture
@@ -125,6 +129,12 @@ Entry: `bot/main.py` builds the `Application`, calls `register_handlers()`, runs
 **LLM relevance** (`bot/relevance.py`): `evaluate_posts()` calls `claude -p <prompt> --output-format json` as a subprocess. It sends a batch of post excerpts and receives `[{urn, relevant, score, reason}]`. This is intentionally separate from `app/scorer.py` — keyword matching is fast and used by the REST API; LLM evaluation is slow and used only by the bot. Call from a thread executor — it blocks.
 
 **Triage flow** (`bot/handlers/feed.py`): `feed:scan` callback scrapes, runs LLM eval, then presents posts one card at a time. Each card is edited in place; actions are Comment / Keep / Skip / Not relevant. State is persisted immediately via `PostsStore`.
+
+**LLM evaluation is batched** (`EVAL_BATCH_SIZE = 25` posts/call, measured ~1.1s/post): a single oversized `claude -p` call for the whole unnotified backlog used to risk exceeding `CLAUDE_TIMEOUT`, and — because a failed call used to leave every candidate unnotified — a single timeout meant the backlog got re-queued on top of whatever was new next scan, an unbounded growth that made every subsequent scan fail too. Each batch is now marked notified (via `PostsStore.mark_notified`) as soon as it succeeds, so a later batch failing can't undo progress already made; unevaluated posts simply retry on the next scan (see `tests/test_feed_scan_batching.py`).
+
+**Scan progress**: most of a scrape's wall time isn't the scroll/network-idle wait but `LinkedInScraper._resolve_post_url()` resolving a real permalink for every newly-seen post one at a time, since the feed DOM almost never exposes a real `urn:li:activity` id directly (see `app/scraper.py`). It opens each post's "more options" menu, clicks "Copy link to post", and reads the permalink from the confirmation toast's "View post" link (`_TOAST_VIEW_POST_LOCATOR`) — not from the OS clipboard, which doesn't reliably round-trip in headless Chromium (confirmed by live testing: the click lands and the toast renders, but neither `navigator.clipboard.writeText()` nor a native `copy` event ever fires here). `LinkedInScraper.scrape()` takes an `on_progress: Callable[[str], None]` callback, invoked once after the initial extraction and once per scroll step with the same text as the corresponding log line. `bot/handlers/feed.py::_make_progress_reporter()` bridges it back into the running event loop with `asyncio.run_coroutine_threadsafe` (the scraper itself runs in a thread executor) and live-edits the "⏳ Scanning…" message with each update. Logs (scraper progress, httpx, apscheduler, telegram.ext, ...) go to both stdout and a rotating file at `logs/bot.log` (`bot/main.py::_configure_logging()`) — `tail -f logs/bot.log` to watch a scan in real time; httpx's per-long-poll-request INFO lines are silenced there to keep the scraper's own progress lines visible.
+
+**Comment drafting** (`bot/comment.py`, wired into `bot/handlers/feed.py`): "Comment" triggers `generate_comment_variants()` (another `claude -p` subprocess call, same pattern as `relevance.py`) for 3 angled drafts (nuance / personal experience / question). The user can pick one, regenerate, or send a free-text adjustment instruction. "Remind in 1h" schedules a follow-up message via `ctx.application.job_queue.run_once()` — this requires the `job-queue` extra (APScheduler) to be installed; without it `job_queue` is silently `None` and tapping the button raises `AttributeError`. Covered by `tests/test_comment_remind.py`.
 
 **Storage split**:
 - `app/storage.py` / `posts.json` — owned by the REST API and MCP server

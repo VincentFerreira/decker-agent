@@ -1,6 +1,9 @@
 import hashlib
 import logging
 import re
+import time
+import urllib.parse
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 from scrapling.fetchers import StealthyFetcher
@@ -232,6 +235,17 @@ def _extract_posts(page) -> list[Post]:
             else:
                 url = ""
 
+            # --- Author profile URL ---
+            # Always available with no interaction, unlike the exact post
+            # permalink (see _resolve_post_url) — a fallback link the bot
+            # can use when the real permalink didn't resolve. This static
+            # snapshot only runs as a final supplementary pass (the live JS
+            # extraction above is the primary path and does the more
+            # precise name-matched lookup), so just take the nearest
+            # preceding profile link here.
+            author_url_candidates = el.xpath("preceding::a[contains(@href, '/in/')][1]/@href")
+            author_url = str(author_url_candidates[0]) if author_url_candidates else ""
+
             # --- Publish date ---
             # LinkedIn shows a relative age next to the author (e.g. "2 h •",
             # "3 j • Modifié •") instead of an exact timestamp. Parse the
@@ -254,6 +268,7 @@ def _extract_posts(page) -> list[Post]:
                 scraped_at=now,
                 posted_at=posted_at,
                 url=url,
+                author_url=author_url,
             ))
         except Exception as exc:
             logger.debug("Skipped element: %s", exc)
@@ -276,6 +291,13 @@ _JS_EXTRACT_POSTS = r"""
         .filter(b => AUTHOR_RE.test(b.getAttribute('aria-label')));
     const timeSpans = Array.from(document.querySelectorAll('span'))
         .filter(s => TIME_RE.test((s.textContent || '').trim()));
+    // Author profile links — always present in the DOM, no interaction
+    // needed, unlike the exact post permalink (see _resolve_post_url). A
+    // post with a "Followed by X" header can have more than one profile
+    // link nearby, so per-post lookup below prefers one whose text matches
+    // the author name over just the nearest preceding one.
+    const profileLinks = Array.from(document.querySelectorAll('a[href]'))
+        .filter(a => /^https?:\/\/[^/]*linkedin\.com\/in\//i.test(a.href));
     // Reaction counts now live many elements deep in a sibling subtree, not
     // among el's direct siblings — precompute every matching leaf, in
     // document order, and pick the nearest one that follows el (same
@@ -354,8 +376,22 @@ _JS_EXTRACT_POSTS = r"""
             }
         }
 
+        // Nearest preceding profile link, preferring one whose text matches
+        // the author's first name within a small lookback window (avoids
+        // picking a "Followed by X" connector link ahead of the real author).
+        let authorUrl = '';
+        const firstName = author !== 'Unknown' ? author.toLowerCase().split(' ')[0] : '';
+        let checked = 0;
+        for (let i = profileLinks.length - 1; i >= 0 && checked < 4; i--) {
+            if (!(profileLinks[i].compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+            checked++;
+            if (!authorUrl) authorUrl = profileLinks[i].href;
+            const linkText = (profileLinks[i].textContent || '').trim().toLowerCase();
+            if (firstName && linkText.includes(firstName)) { authorUrl = profileLinks[i].href; break; }
+        }
+
         results.push({
-            urn, author, text, reactions, ageText,
+            urn, author, text, reactions, ageText, authorUrl,
             componentkey: el.getAttribute('componentkey') || '',
             url: urn.includes('urn:li:activity:')
                 ? 'https://www.linkedin.com/feed/update/' + urn + '/' : '',
@@ -394,7 +430,7 @@ def _extract_posts_js(page, now: datetime) -> list[tuple[Post, str]]:
             Post(urn=urn, author=p["author"], text=p["text"],
                  reactions=p.get("reactions", 0), scraped_at=now,
                  posted_at=_parse_relative_age(p.get("ageText", ""), now),
-                 url=url),
+                 url=url, author_url=p.get("authorUrl", "")),
             p.get("componentkey", ""),
         ))
     return posts
@@ -404,17 +440,38 @@ _COPY_LINK_LOCATOR = (
     '[role="menuitem"]:has-text("Copier le lien vers le post"), '
     '[role="menuitem"]:has-text("Copy link to post")'
 )
+# After clicking "Copy link to post", LinkedIn shows a toast — "Lien ajouté
+# au presse-papiers. Voir le post." / "Link copied. View post." — whose
+# "Voir le post"/"View post" link already carries the real permalink. Read
+# that directly instead of the OS clipboard, which doesn't reliably
+# round-trip in headless Chromium (confirmed via live testing: the menu
+# click lands correctly and the toast appears, but neither
+# navigator.clipboard.writeText() nor a native 'copy' event ever fires —
+# LinkedIn's click handler apparently doesn't go through the Clipboard API
+# at all here, it just renders this toast).
+_TOAST_VIEW_POST_LOCATOR = 'a:has-text("Voir le post"), a:has-text("View post")'
+
+
+def _unwrap_safety_redirect(href: str) -> str:
+    """LinkedIn's toast link points at its own /safety/go/?url=... redirector,
+    not the post directly — unwrap it to the real target URL."""
+    parsed = urllib.parse.urlparse(href)
+    if parsed.path == "/safety/go/":
+        target = urllib.parse.parse_qs(parsed.query).get("url", [None])[0]
+        if target:
+            return target
+    return href
 
 
 def _resolve_post_url(page, componentkey: str) -> str:
     """Resolve a working permalink for a post via its "more options" → "Copy
-    link to post" menu, reading the result back from the clipboard.
+    link to post" menu, reading it from the confirmation toast's "View post"
+    link (see _TOAST_VIEW_POST_LOCATOR).
 
     LinkedIn's current feed DOM almost never exposes a real `urn:li:activity`
     id in its attributes (see the comments in _extract_posts/_extract_posts_js)
     — every post falls back to a content-hash URN with no derivable URL. The
-    share menu is the one place LinkedIn still hands out a canonical permalink
-    (e.g. https://www.linkedin.com/posts/<author-slug>_..._-share-<id>-<rand>/),
+    share menu is the one place LinkedIn still hands out a canonical permalink,
     so this is the reliable way to guarantee an "Open on LinkedIn" link.
 
     Scoped via the post's own `componentkey` (XPath `preceding::` from that
@@ -423,6 +480,8 @@ def _resolve_post_url(page, componentkey: str) -> str:
     """
     if not componentkey:
         return ""
+    t0 = time.monotonic()
+    key = componentkey[:16]
     try:
         menu_btn = page.locator(
             f'xpath=//*[@componentkey="{componentkey}"]'
@@ -430,27 +489,40 @@ def _resolve_post_url(page, componentkey: str) -> str:
             "or contains(@aria-label, 'Open control menu for post by')][1]"
         ).first
         if menu_btn.count() == 0:
+            logger.debug("resolve_url[%s]: no menu button (%.2fs)", key, time.monotonic() - t0)
             return ""
 
         menu_btn.scroll_into_view_if_needed(timeout=5000)
         menu_btn.click(timeout=5000)
-        page.wait_for_timeout(400)
 
         copy_item = page.locator(_COPY_LINK_LOCATOR).first
-        if copy_item.count() == 0:
+        try:
+            # Auto-waits/polls for the item to render and become clickable,
+            # instead of a fixed sleep + one-shot count() check that can race
+            # a menu rendering slightly late.
+            copy_item.click(timeout=1500)
+        except Exception:
             page.keyboard.press("Escape")
+            page.wait_for_timeout(300)  # settle before the next post's click
+            logger.debug("resolve_url[%s]: no copy-link item (%.2fs)", key, time.monotonic() - t0)
             return ""
 
-        copy_item.click(timeout=5000)
-        page.wait_for_timeout(400)
-        link = page.evaluate("() => navigator.clipboard.readText()")
+        toast_link = page.locator(_TOAST_VIEW_POST_LOCATOR).first
+        try:
+            href = toast_link.get_attribute("href", timeout=1500)
+        except Exception:
+            href = None
         page.keyboard.press("Escape")
         page.wait_for_timeout(200)
 
-        if link and "linkedin.com" in link:
-            return link.split("?")[0]  # drop utm_*/rcm tracking params
+        elapsed = time.monotonic() - t0
+        if href:
+            url = _unwrap_safety_redirect(href)
+            logger.debug("resolve_url[%s]: OK in %.2fs", key, elapsed)
+            return url
+        logger.debug("resolve_url[%s]: no toast link after %.2fs", key, elapsed)
     except Exception as exc:
-        logger.debug("Link resolution failed for componentkey %s: %s", componentkey, exc)
+        logger.debug("resolve_url[%s]: exception after %.2fs: %s", key, time.monotonic() - t0, exc)
         try:
             page.keyboard.press("Escape")
         except Exception:
@@ -461,31 +533,67 @@ def _resolve_post_url(page, componentkey: str) -> str:
 def _merge_resolved(accumulated: dict[str, Post], extractions: list[tuple[Post, str]], page) -> None:
     """Merge freshly-extracted posts into `accumulated`, resolving a real
     permalink for any post whose DOM-derived `url` is empty. Resolution runs
-    at most once per post — a previously-resolved url is carried forward when
-    the same post is re-extracted on a later scroll step."""
+    at most once per post — a previously-resolved `url` (or a previously-seen
+    `author_url`, in case a later extraction pass doesn't catch it) is
+    carried forward when the same post is re-extracted on a later scroll step."""
+    t0 = time.monotonic()
+    resolved_count = 0
     for post, componentkey in extractions:
+        prior = accumulated.get(post.urn)
+        updates = {}
         if not post.url:
-            prior = accumulated.get(post.urn)
             if prior and prior.url:
-                post = post.model_copy(update={"url": prior.url})
+                updates["url"] = prior.url
             else:
+                resolved_count += 1
                 resolved = _resolve_post_url(page, componentkey)
                 if resolved:
-                    post = post.model_copy(update={"url": resolved})
+                    updates["url"] = resolved
+        if not post.author_url and prior and prior.author_url:
+            updates["author_url"] = prior.author_url
+        if updates:
+            post = post.model_copy(update=updates)
         accumulated[post.urn] = post
+    if resolved_count:
+        logger.info(
+            "Resolved permalinks for %d/%d post(s) in %.1fs (%.2fs/post avg)",
+            resolved_count, len(extractions), time.monotonic() - t0,
+            (time.monotonic() - t0) / resolved_count,
+        )
+
+
+def _initial_progress_message(count: int) -> str:
+    return f"Initial extraction: {count} posts"
+
+
+def _scroll_progress_message(step: int, max_scrolls: int, total: int, gained: int) -> str:
+    return f"Scroll {step}/{max_scrolls} — {total} posts total (+{gained})"
 
 
 class LinkedInScraper:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    def scrape(self, scroll_attempts: int | None = None) -> list[Post]:
+    def scrape(
+        self,
+        scroll_attempts: int | None = None,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> list[Post]:
         """Fetch the LinkedIn feed with in-page scrolling to accumulate posts.
 
         LinkedIn uses a virtual scroller: posts leave the DOM when they scroll
         out of view. We extract after each scroll step via JS evaluation
         (no full HTML strings or lxml trees) and accumulate in a shared dict.
         scroll_attempts = number of scroll steps (each loads ~5-10 new posts).
+
+        `on_progress`, if given, is called with the same text as each
+        progress log line (initial extraction, then one call per scroll
+        step) — callers can use it to surface live status elsewhere (see
+        bot/handlers/feed.py, which relays it into the Telegram message).
+        Most of a scroll step's wall time goes to `_resolve_post_url`
+        resolving a real permalink for every newly-seen post one at a time
+        (menu click + toast read per post) — that's the actual bottleneck,
+        not the scroll/network-idle wait itself.
         """
         max_scrolls = scroll_attempts if scroll_attempts is not None else self._settings.max_scroll_attempts
         cookies = load_cookies(self._settings.cookies_file)
@@ -493,13 +601,6 @@ class LinkedInScraper:
         now = datetime.now(tz=timezone.utc)
 
         def scroll_and_collect(page) -> None:
-            # Needed to read back the permalink that LinkedIn's "Copy link to
-            # post" menu item writes to the clipboard (see _resolve_post_url).
-            try:
-                page.context.grant_permissions(["clipboard-read", "clipboard-write"])
-            except Exception:
-                pass
-
             # LinkedIn is a React SPA — wait for the first posts to render.
             try:
                 page.wait_for_selector(
@@ -511,7 +612,10 @@ class LinkedInScraper:
                 return
 
             _merge_resolved(accumulated, _extract_posts_js(page, now), page)
-            logger.info("Initial extraction: %d posts", len(accumulated))
+            msg = _initial_progress_message(len(accumulated))
+            logger.info(msg)
+            if on_progress:
+                on_progress(msg)
 
             consecutive_empty = 0
             for step in range(max_scrolls):
@@ -551,7 +655,10 @@ class LinkedInScraper:
                 _merge_resolved(accumulated, _extract_posts_js(page, now), page)
 
                 gained = len(accumulated) - prev_count
-                logger.info("Scroll %d/%d — %d posts total (+%d)", step + 1, max_scrolls, len(accumulated), gained)
+                msg = _scroll_progress_message(step + 1, max_scrolls, len(accumulated), gained)
+                logger.info(msg)
+                if on_progress:
+                    on_progress(msg)
 
                 if gained == 0:
                     consecutive_empty += 1

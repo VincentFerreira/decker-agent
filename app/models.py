@@ -12,6 +12,11 @@ class Post(BaseModel):
     score: float = 0.0
     matched_keywords: list[str] = []
     url: str = ""
+    # Author's profile URL — always derivable from the DOM with zero extra
+    # interaction, unlike `url` (the exact post permalink, which needs a
+    # menu click to resolve and doesn't always succeed). Callers that just
+    # need *a* working LinkedIn link can fall back to this when `url` is empty.
+    author_url: str = ""
     delivered: bool = False
 
 

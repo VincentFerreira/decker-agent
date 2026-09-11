@@ -36,6 +36,14 @@ _scrape_lock = asyncio.Lock()
 TEXT_PREVIEW_LEN = 220
 _SEPARATOR = "─" * 24
 
+# Posts per evaluate_posts() call. A single oversized batch risks blowing
+# past CLAUDE_TIMEOUT (measured ~1.1s/post) and, worse, an all-or-nothing
+# failure used to leave every candidate unnotified — re-queued on top of
+# whatever's new next scan, an ever-growing backlog that made subsequent
+# scans fail too. Batching bounds each call and lets progress made on
+# earlier batches survive a later one failing (see cb_feed_scan).
+EVAL_BATCH_SIZE = 25
+
 SCAN_BUTTON = InlineKeyboardButton("🔍 New posts", callback_data="feed:scan")
 _CONFIG_BUTTON = InlineKeyboardButton("⚙️ Config", callback_data="config:show")
 _SCAN_AGAIN_KEYBOARD = InlineKeyboardMarkup([[SCAN_BUTTON]])
@@ -51,10 +59,32 @@ _BROWSE_ACTIONS = {
 }
 
 
-def _sync_scrape() -> list[dict]:
+def _sync_scrape(on_progress) -> list[dict]:
     """Run the scraper synchronously — call via a thread executor."""
-    posts = LinkedInScraper(get_settings()).scrape()
+    posts = LinkedInScraper(get_settings()).scrape(on_progress=on_progress)
     return [p.model_dump(mode="json") for p in posts]
+
+
+def _make_progress_reporter(query, loop: asyncio.AbstractEventLoop):
+    """Build the `on_progress` callback passed into LinkedInScraper.scrape().
+
+    The scraper runs in a worker thread (via run_in_executor), but editing a
+    Telegram message must happen on the event loop — so this bridges the two
+    with `run_coroutine_threadsafe` rather than awaiting directly. Errors
+    from `edit_message_text` (rate limits, "message not modified" on an
+    identical scroll count) are swallowed: a missed progress update isn't
+    worth failing the scan over.
+    """
+    async def _push(text: str) -> None:
+        try:
+            await query.edit_message_text(f"⏳ Scanning your feed…\n\n{text}")
+        except Exception:
+            pass
+
+    def _on_progress(text: str) -> None:
+        asyncio.run_coroutine_threadsafe(_push(text), loop)
+
+    return _on_progress
 
 
 def _format_card(post: dict, index: int, total: int) -> str:
@@ -80,17 +110,33 @@ def _format_card(post: dict, index: int, total: int) -> str:
     return "\n".join(lines)
 
 
+def _post_link(post: dict) -> tuple[str, str]:
+    """Best available link for a post: the exact permalink when the scraper
+    managed to resolve one, otherwise the author's profile (always available,
+    see app/scraper.py's `_resolve_post_url` vs `author_url`). Returns
+    `(label, url)`, or `("", "")` when neither is available."""
+    if post.get("url"):
+        return "🔗 Open on LinkedIn", post["url"]
+    if post.get("author_url"):
+        return "🔗 Open author's profile", post["author_url"]
+    return "", ""
+
+
 def _browse_keyboard(post: dict) -> InlineKeyboardMarkup:
     """Triage actions attached to a browse card — shared by the scan results
-    and the "found posts" browser so both stay visually consistent."""
-    rows = [[
+    and the "found posts" browser so both stay visually consistent. The link
+    row comes first — reading the actual post is usually the first thing
+    needed before deciding what to do with it."""
+    rows = []
+    label, url = _post_link(post)
+    if url:
+        rows.append([InlineKeyboardButton(label, url=url)])
+    rows.append([
         InlineKeyboardButton("💬 Comment", callback_data="browse:comment"),
         InlineKeyboardButton("🔖 Keep", callback_data="browse:keep"),
         InlineKeyboardButton("⏭️ Skip", callback_data="browse:skip"),
         InlineKeyboardButton("🚫 Not relevant", callback_data="browse:notrelevant"),
-    ]]
-    if post.get("url"):
-        rows.append([InlineKeyboardButton("🔗 Open on LinkedIn", url=post["url"])])
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -152,8 +198,14 @@ def _format_variants_message(post: dict, variants: list[dict]) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _variants_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def _variants_keyboard(post: dict) -> InlineKeyboardMarkup:
+    """Link row first, same as _browse_keyboard — without it, checking the
+    actual post from here meant backing all the way out of the comment flow."""
+    rows = []
+    label, url = _post_link(post)
+    if url:
+        rows.append([InlineKeyboardButton(label, url=url)])
+    rows += [
         [
             InlineKeyboardButton("① Use", callback_data="comment:use:0"),
             InlineKeyboardButton("② Use", callback_data="comment:use:1"),
@@ -164,7 +216,8 @@ def _variants_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔄 Regenerate", callback_data="comment:regen"),
             InlineKeyboardButton("⬅️ Back", callback_data="comment:back"),
         ],
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def _format_ready_message(comment_text: str) -> str:
@@ -176,6 +229,10 @@ def _ready_keyboard(post: dict) -> InlineKeyboardMarkup:
     rows = []
     if post.get("url"):
         rows.append([InlineKeyboardButton("🔗 Open post to paste", url=post["url"])])
+    elif post.get("author_url"):
+        # Not the exact post (no resolved permalink), so don't imply pasting
+        # a comment there works — this just gets the user to the right person.
+        rows.append([InlineKeyboardButton("🔗 Open author's profile", url=post["author_url"])])
     rows.append([
         InlineKeyboardButton("✔️ I posted", callback_data="comment:posted"),
         InlineKeyboardButton("⏰ Remind in 1h", callback_data="comment:remind"),
@@ -207,12 +264,13 @@ async def cb_feed_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("⏳ A scan is already running — hang tight.")
         return
 
-    await query.edit_message_text("⏳ Scanning your feed… (30–90s)")
+    await query.edit_message_text("⏳ Scanning your feed…")
     loop = asyncio.get_event_loop()
+    on_progress = _make_progress_reporter(query, loop)
 
     async with _scrape_lock:
         try:
-            scraped = await loop.run_in_executor(None, _sync_scrape)
+            scraped = await loop.run_in_executor(None, _sync_scrape, on_progress)
         except AuthenticationError:
             await query.edit_message_text(
                 "❌ LinkedIn rejected the session — your cookies are likely expired.\n"
@@ -235,10 +293,43 @@ async def cb_feed_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await query.edit_message_text(f"🤖 Asking Claude to judge {len(candidates)} new post(s)…")
-    verdicts = await loop.run_in_executor(None, evaluate_posts, candidates, interests)
+    relevant, evaluated_urns, failed_batches = [], [], 0
+    batches = [candidates[i:i + EVAL_BATCH_SIZE] for i in range(0, len(candidates), EVAL_BATCH_SIZE)]
 
-    if not verdicts:
+    for i, batch in enumerate(batches):
+        if len(batches) > 1:
+            await query.edit_message_text(
+                f"🤖 Asking Claude to judge new posts… ({i * EVAL_BATCH_SIZE + len(batch)}/{len(candidates)})"
+            )
+        else:
+            await query.edit_message_text(f"🤖 Asking Claude to judge {len(batch)} new post(s)…")
+
+        verdicts = await loop.run_in_executor(None, evaluate_posts, batch, interests)
+        if not verdicts:
+            failed_batches += 1
+            logger.warning("Claude evaluation failed for a batch of %d post(s) — will retry next scan", len(batch))
+            continue  # these posts stay unnotified and get retried on the next scan
+
+        # Mark this batch notified right away — a later batch failing must
+        # not wipe out progress on posts already evaluated (see feed.py
+        # history: this used to be all-or-nothing per scan, which let a
+        # single slow/oversized batch make an ever-growing backlog of
+        # unnotified posts fail every subsequent scan too).
+        batch_urns = []
+        for post in batch:
+            verdict = verdicts.get(post["urn"])
+            if verdict is None:
+                continue
+            batch_urns.append(post["urn"])
+            _posts_store.set_relevance(post["urn"], verdict["relevant"], verdict["reason"], verdict.get("score"))
+            if verdict["relevant"]:
+                post["score"] = verdict.get("score")
+                post["reason"] = verdict["reason"]
+                relevant.append(post)
+        evaluated_urns.extend(batch_urns)
+        _posts_store.mark_notified(batch_urns)
+
+    if not evaluated_urns:
         await query.edit_message_text(
             "⚠️ Couldn't get Claude's evaluation this time — the new posts are still "
             "pending and will be retried on the next scan.",
@@ -246,21 +337,10 @@ async def cb_feed_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    relevant, evaluated_urns = [], []
-    for post in candidates:
-        verdict = verdicts.get(post["urn"])
-        if verdict is None:
-            continue
-        evaluated_urns.append(post["urn"])
-        _posts_store.set_relevance(post["urn"], verdict["relevant"], verdict["reason"], verdict.get("score"))
-        if verdict["relevant"]:
-            post["score"] = verdict.get("score")
-            post["reason"] = verdict["reason"]
-            relevant.append(post)
-
+    failed_note = f" ({failed_batches} batch(es) failed, will retry next scan)" if failed_batches else ""
     if not relevant:
         await query.edit_message_text(
-            f"✅ Scan complete — Claude reviewed {len(evaluated_urns)} new post(s), "
+            f"✅ Scan complete — Claude reviewed {len(evaluated_urns)} new post(s){failed_note}, "
             f"none worth your time right now.",
             reply_markup=_SCAN_AGAIN_KEYBOARD,
         )
@@ -269,11 +349,9 @@ async def cb_feed_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             query,
             ctx,
             relevant,
-            done_text=f"✅ Reviewed all {len(relevant)} post(s) worth a look.",
+            done_text=f"✅ Reviewed all {len(relevant)} post(s) worth a look{failed_note}.",
             done_keyboard=_SCAN_AGAIN_KEYBOARD,
         )
-
-    _posts_store.mark_notified(evaluated_urns)
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +417,7 @@ async def cb_comment_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         _format_variants_message(post, variants),
         parse_mode=ParseMode.HTML,
-        reply_markup=_variants_keyboard(),
+        reply_markup=_variants_keyboard(post),
         disable_web_page_preview=True,
     )
 
@@ -401,7 +479,7 @@ async def cb_comment_regen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         _format_variants_message(post, variants),
         parse_mode=ParseMode.HTML,
-        reply_markup=_variants_keyboard(),
+        reply_markup=_variants_keyboard(post),
         disable_web_page_preview=True,
     )
 
@@ -462,7 +540,7 @@ async def receive_comment_adjust(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(
         _format_variants_message(post, variants),
         parse_mode=ParseMode.HTML,
-        reply_markup=_variants_keyboard(),
+        reply_markup=_variants_keyboard(post),
         disable_web_page_preview=True,
     )
 
@@ -490,7 +568,7 @@ async def cb_comment_back_variants(update: Update, ctx: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(
         _format_variants_message(comment_state["post"], comment_state["variants"]),
         parse_mode=ParseMode.HTML,
-        reply_markup=_variants_keyboard(),
+        reply_markup=_variants_keyboard(comment_state["post"]),
         disable_web_page_preview=True,
     )
 
@@ -528,8 +606,9 @@ async def cb_comment_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         async def _remind(context: ContextTypes.DEFAULT_TYPE) -> None:
             msg = f"⏰ <b>Reminder: post your comment!</b>\n\n<code>{html.escape(selected_text)}</code>"
-            if post.get("url"):
-                msg += f'\n\n<a href="{html.escape(post["url"])}">Open post →</a>'
+            link_label, link_url = _post_link(post)
+            if link_url:
+                msg += f'\n\n<a href="{html.escape(link_url)}">{link_label} →</a>'
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML)
 
         ctx.application.job_queue.run_once(_remind, when=3600, chat_id=chat_id)
