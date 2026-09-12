@@ -452,6 +452,28 @@ _COPY_LINK_LOCATOR = (
 _TOAST_VIEW_POST_LOCATOR = 'a:has-text("Voir le post"), a:has-text("View post")'
 
 
+def _close_menu(page, timeout_ms: int = 400) -> None:
+    """Escape-close whatever post-options menu is open and wait for its
+    "Copy link to post" item to actually unmount before returning.
+
+    A menu that's still mid-close when the next post's menu_btn.click()
+    fires is what lets `_resolve_post_url`'s page-wide `_COPY_LINK_LOCATOR`
+    / `_TOAST_VIEW_POST_LOCATOR` locators pick up a STALE item belonging to
+    the previous post instead of the one just opened — unlike a stale toast
+    (guarded against below via the baseline/poll-for-change check), a stale
+    menu item click hands back a different post's real, valid-looking URL,
+    so nothing there flags it as wrong. Confirmed against live data: two
+    completely different posts (different author, different urn) ending up
+    with the identical resolved link from the same scrape run. A fixed
+    sleep can't guarantee the previous menu is gone, so poll for it instead.
+    """
+    page.keyboard.press("Escape")
+    try:
+        page.locator(_COPY_LINK_LOCATOR).first.wait_for(state="hidden", timeout=timeout_ms)
+    except Exception:
+        page.wait_for_timeout(timeout_ms)
+
+
 def _unwrap_safety_redirect(href: str) -> str:
     """LinkedIn's toast link points at its own /safety/go/?url=... redirector,
     not the post directly — unwrap it to the real target URL."""
@@ -479,7 +501,11 @@ def _resolve_post_url(page, componentkey: str) -> str:
     same author can't resolve to each other's link. Returns "" (never a
     wrong link) when a fresh toast doesn't show up in time — see the
     baseline/poll-for-change logic below for why a naive "read whatever toast
-    link exists" check isn't safe.
+    link exists" check isn't safe, and _close_menu for why closing the
+    PREVIOUS post's menu cleanly matters just as much: a stale leftover menu
+    item is what lets this silently return a different post's (genuinely
+    valid) link instead of failing loud. `_merge_resolved` adds a same-run
+    collision check on top of this as a last-resort backstop.
     """
     if not componentkey:
         return ""
@@ -498,7 +524,30 @@ def _resolve_post_url(page, componentkey: str) -> str:
         menu_btn.scroll_into_view_if_needed(timeout=5000)
         menu_btn.click(timeout=5000)
 
-        copy_item = page.locator(_COPY_LINK_LOCATOR).first
+        copy_items = page.locator(_COPY_LINK_LOCATOR)
+        try:
+            # Auto-waits/polls for the item to render, instead of a fixed
+            # sleep + one-shot count() check that can race a menu rendering
+            # slightly late.
+            copy_items.first.wait_for(state="visible", timeout=1500)
+        except Exception:
+            _close_menu(page)
+            logger.debug("resolve_url[%s]: no copy-link item (%.2fs)", key, time.monotonic() - t0)
+            return ""
+
+        if copy_items.count() > 1:
+            # More than one "Copy link to post" item visible at once means
+            # a previous post's menu hasn't fully closed yet — we can't
+            # tell which one belongs to THIS post's freshly-opened menu, so
+            # bail rather than risk clicking (and resolving) the wrong one.
+            _close_menu(page)
+            logger.debug(
+                "resolve_url[%s]: %d copy-link items present, skipping (%.2fs)",
+                key, copy_items.count(), time.monotonic() - t0,
+            )
+            return ""
+
+        copy_item = copy_items.first
         # Capture whatever toast link is on screen BEFORE clicking — the
         # toast is a reused element that doesn't always swap in its new
         # content synchronously with the click, so a plain "does a toast
@@ -512,14 +561,10 @@ def _resolve_post_url(page, componentkey: str) -> str:
             baseline_href = None
 
         try:
-            # Auto-waits/polls for the item to render and become clickable,
-            # instead of a fixed sleep + one-shot count() check that can race
-            # a menu rendering slightly late.
             copy_item.click(timeout=1500)
         except Exception:
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(300)  # settle before the next post's click
-            logger.debug("resolve_url[%s]: no copy-link item (%.2fs)", key, time.monotonic() - t0)
+            _close_menu(page)
+            logger.debug("resolve_url[%s]: copy-link click failed (%.2fs)", key, time.monotonic() - t0)
             return ""
 
         href = None
@@ -534,8 +579,7 @@ def _resolve_post_url(page, componentkey: str) -> str:
                 break
             page.wait_for_timeout(150)
 
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(200)
+        _close_menu(page)
 
         elapsed = time.monotonic() - t0
         if href:
@@ -557,9 +601,18 @@ def _merge_resolved(accumulated: dict[str, Post], extractions: list[tuple[Post, 
     permalink for any post whose DOM-derived `url` is empty. Resolution runs
     at most once per post — a previously-resolved `url` (or a previously-seen
     `author_url`, in case a later extraction pass doesn't catch it) is
-    carried forward when the same post is re-extracted on a later scroll step."""
+    carried forward when the same post is re-extracted on a later scroll step.
+
+    Last-resort backstop on top of _resolve_post_url's own menu-hygiene
+    checks: if a freshly resolved URL is already bound to a DIFFERENT urn
+    this run, it's discarded instead of assigned. Confirmed against live
+    data that this does happen (a stale menu-item click can hand back
+    another post's real, validly-formed link — see _close_menu) — silently
+    keeping it would send the user to the wrong post, which is strictly
+    worse than falling back to the author-profile link."""
     t0 = time.monotonic()
     resolved_count = 0
+    resolved_urls = {p.url for p in accumulated.values() if p.url}
     for post, componentkey in extractions:
         prior = accumulated.get(post.urn)
         updates = {}
@@ -569,8 +622,14 @@ def _merge_resolved(accumulated: dict[str, Post], extractions: list[tuple[Post, 
             else:
                 resolved_count += 1
                 resolved = _resolve_post_url(page, componentkey)
-                if resolved:
+                if resolved and resolved in resolved_urls:
+                    logger.warning(
+                        "resolve_url: discarding %s for %s — already resolved to a different post this run",
+                        resolved, post.urn,
+                    )
+                elif resolved:
                     updates["url"] = resolved
+                    resolved_urls.add(resolved)
         if not post.author_url and prior and prior.author_url:
             updates["author_url"] = prior.author_url
         if updates:
