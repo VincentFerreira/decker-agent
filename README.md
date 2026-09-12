@@ -4,12 +4,11 @@ Decker Agent is your LinkedIn presence co-pilot. It silently monitors your feed,
 
 Instead of opening LinkedIn and getting lost, you open Telegram: Decker has already scraped your feed, ranked the posts, run them through Claude to identify the ones where your voice adds value, and queued them up for you one card at a time. You read, decide — Comment / Keep / Skip / Not relevant — and move on. The research is done; you just bring the insight.
 
-The system is built around two cooperating components:
+The system is built around one scraper core (`app/`, driving a real Chromium browser via Scrapling/Patchright to scrape your LinkedIn feed without triggering anti-bot protections, and scoring posts by keyword relevance) exposed through three independent entry points — **you only run the one(s) you need, not all three**:
 
-- **Scraper API** — a FastAPI service that drives a real Chromium browser (via Scrapling/Patchright) to scrape your LinkedIn feed without triggering anti-bot protections, scores posts by keyword relevance, and persists them locally.
-- **Decker bot** — a Telegram bot that orchestrates the full workflow: trigger a scrape, send posts to Claude for LLM-based relevance evaluation, present them as triage cards, and help you craft comments directly from the chat.
-
-It also ships an **MCP server** so Claude Code can call the scraper directly as tools — useful for ad-hoc exploration or scripting from a Claude Code session.
+- **Decker bot** (`bot/`, run via `python -m bot.main`) — a Telegram bot that imports the scraper core directly and orchestrates the full workflow: trigger a scrape, send posts to Claude for LLM-based relevance evaluation, present them as triage cards, and help you craft comments — all from the chat. This is the only piece most users need; see [Running the Bot](#running-the-bot-decker).
+- **Scraper REST API** (`main.py`) — a FastAPI service exposing the same scraper core over HTTP (`/scrape`, `/posts`, ...). Optional — useful for curl/Swagger/other consumers, not required by the bot.
+- **MCP server** (`mcp_server.py`) — lets Claude Code call the scraper directly as tools from a Claude Code session. Spawned automatically by Claude Code via `.mcp.json`; you never launch it by hand.
 
 ```
 POST /scrape             → trigger a LinkedIn feed scrape
@@ -31,8 +30,9 @@ The scraper uses [Scrapling](https://github.com/D4Vinci/Scrapling) with `Stealth
 ## Installation
 
 ```bash
-# 1. Create and activate the virtualenv
-python -m venv .venv
+# 1. Create and activate the virtualenv (python3 is required here since .venv doesn't exist yet —
+#    many systems have no bare `python` on PATH at all)
+python3 -m venv .venv
 source .venv/bin/activate
 
 # 2. Install dependencies
@@ -96,10 +96,27 @@ curl -X POST http://localhost:8000/config/cookies \
   -F "file=@/path/to/new_cookies.json"
 ```
 
-## Starting the Server
+## Running the Bot (Decker)
+
+This is the only process most users need. It runs the full workflow — scrape, LLM relevance scoring, triage cards, comment drafting — with no other process required (it imports the scraper directly, it doesn't call the REST API below).
 
 ```bash
-python main.py
+.venv/bin/python -m bot.main
+# equivalently: .venv/bin/python telegram_bot.py
+```
+
+> Use the venv's interpreter directly (`.venv/bin/python`), not a bare `python`/`python3` — most systems have no `python` on `PATH` at all (only `python3`), and even `python3 -m bot.main` would run against the system interpreter, missing the dependencies installed into `.venv`. If you did `source .venv/bin/activate` in the *same* shell first, plain `python -m bot.main` also works — but the activation doesn't persist across separate shell invocations (e.g. each tool call in an automated session, or a new terminal), so the absolute path is the reliable form for scripts, cron, systemd, etc.
+
+Watch it live with `tail -f logs/bot.log`. Requires `TELEGRAM_BOT_TOKEN` and `TELEGRAM_USER_ID` in `.env` (see [Configuration](#configuration)) and valid `cookies.json` (see [Cookie-based Authentication](#cookie-based-authentication)).
+
+**Only run one instance at a time** — a second `bot.main` process racing the same bot token causes Telegram to reject both with `Conflict: terminated by other getUpdates request` until one is killed.
+
+## Starting the REST API (optional)
+
+Only needed if you want to drive the scraper over HTTP (curl, Swagger UI, another consumer) instead of through the bot or the CLI script below. The bot above does **not** depend on this running.
+
+```bash
+.venv/bin/python main.py
 ```
 
 The API listens on `http://0.0.0.0:8000`. Interactive Swagger documentation: `http://localhost:8000/docs`.
@@ -242,11 +259,12 @@ Posts are saved to `posts.json` (path configurable via `POSTS_FILE`). Re-scrapes
 ## Project Structure
 
 ```
-linkedin_scraper/
-├── main.py              # uvicorn entry point (REST API)
+decker-agent/
+├── main.py              # uvicorn entry point (REST API, optional)
 ├── scrape.py            # standalone CLI scraper
 ├── mcp_server.py        # MCP server (Claude Code integration)
-├── app/
+├── telegram_bot.py      # thin shim → delegates to bot.main
+├── app/                 # Scraper core (shared by the REST API, MCP server, and the bot)
 │   ├── api.py           # FastAPI routes
 │   ├── config.py        # Settings (pydantic-settings + .env)
 │   ├── cookies.py       # cookie loading and conversion
@@ -254,9 +272,21 @@ linkedin_scraper/
 │   ├── scraper.py       # scraping logic (Scrapling/Patchright)
 │   ├── scorer.py        # keyword scoring
 │   └── storage.py       # JSON persistence
+├── bot/                 # Decker — the Telegram bot (run via `python -m bot.main`)
+│   ├── main.py          # entry point: builds Application, registers handlers, runs polling
+│   ├── config.py        # BOT_TOKEN + AUTHORIZED_USER_ID from env
+│   ├── auth.py          # @restricted — drops updates from unknown users
+│   ├── relevance.py     # LLM relevance scoring (calls `claude -p` as a subprocess)
+│   ├── comment.py       # LLM comment drafting (calls `claude -p` as a subprocess)
+│   ├── handlers/        # feed scan, found list, config, start — CallbackQueryHandlers
+│   └── storage/         # bot_posts.json + bot_settings.json persistence
+├── tests/               # pytest suite (some tests auto-skip without cookies.json)
 ├── .mcp.json            # MCP server registration for Claude Code
 ├── cookies.json         # LinkedIn cookies (to be created, git-ignored)
-├── posts.json           # local database (created automatically)
+├── posts.json           # scraper-side local database (created automatically)
+├── bot_posts.json       # bot-side posts + triage state (created automatically)
+├── bot_settings.json    # bot-side interests config (created automatically)
+├── logs/bot.log         # Decker's rotating log file (created automatically)
 ├── .env                 # local configuration (to be created from .env.example)
 └── requirements.txt
 ```
@@ -270,7 +300,9 @@ linkedin_scraper/
 | `posts_found: 0` without error, duration ~8s | LinkedIn DOM changed or cookies rejected | Check server logs |
 | Posts with `url: ""` | URN not available (no visible comments) | Normal — the URN will be resolved on the next scrape if comments appear |
 | Duplicates of the same post | Post scraped with hash URN then real URN on two passes | Known — resolved by re-scraping (upsert will consolidate) |
-| Port 8000 already in use | Instance already running | `lsof -i :8000` then `kill <PID>` |
+| Port 8000 already in use | REST API instance already running | `lsof -i :8000` then `kill <PID>` |
+| `python: command not found` | No bare `python` on `PATH` (only `python3`), or venv not activated in this shell | Use `.venv/bin/python -m bot.main` (absolute path) instead of relying on activation |
+| `telegram.error.Conflict: terminated by other getUpdates request` | A second `bot.main` process is already polling with the same `TELEGRAM_BOT_TOKEN` | `ps aux \| grep bot.main`, keep only one instance |
 
 ## Technical Notes
 

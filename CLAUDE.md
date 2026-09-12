@@ -8,10 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Two cooperating systems share this repo:
+One scraper core (`app/`) is exposed through three independent entry points that share this repo but do **not** depend on each other at runtime — each is its own process, started separately, and none of them talk to each other over HTTP or otherwise:
 
-1. **Scraper API** — FastAPI REST service that scrapes the LinkedIn feed, scores posts by keyword relevance, and persists them to `posts.json`. Authentication via session cookies only. Scraping uses `StealthyFetcher` (Scrapling + Patchright/Chromium headless).
-2. **Decker** — Telegram bot (`bot/`) that triggers scrapes, sends new posts to Claude Code for LLM-based relevance evaluation, and lets the user triage them one card at a time (Comment / Keep / Skip / Not relevant).
+1. **Decker** — Telegram bot (`bot/`, run via `python -m bot.main`) that imports the scraper core (`app/scraper.py`, `app/config.py`) directly, triggers scrapes, sends new posts to Claude Code (subprocess `claude -p`) for LLM-based relevance evaluation, and lets the user triage them one card at a time (Comment / Keep / Skip / Not relevant). This is the only process needed for full end-user functionality — it does not require the REST API or MCP server to be running.
+2. **Scraper API** (`main.py`/`app/api.py`) — FastAPI REST service that scrapes the LinkedIn feed, scores posts by keyword relevance, and persists them to `posts.json`. Authentication via session cookies only. Scraping uses `StealthyFetcher` (Scrapling + Patchright/Chromium headless). Optional — for HTTP/curl/Swagger access only.
+3. **MCP server** (`mcp_server.py`) — exposes the same scraper core as tools for Claude Code itself. Spawned automatically by Claude Code via `.mcp.json`; never launched manually.
 
 ## Stack
 
@@ -26,31 +27,33 @@ Two cooperating systems share this repo:
 ## Commands
 
 ```bash
-# Setup (run once)
-python -m venv .venv && source .venv/bin/activate
+# Setup (run once) — python3 is required here since .venv doesn't exist yet
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 patchright install chromium          # required — without this, scrapes return 0 posts silently
 
-# Scraper REST API
-python main.py                       # listens on http://0.0.0.0:8000
-# Swagger UI: http://localhost:8000/docs
-
-# CLI scraper (bypasses the API)
-python scrape.py --json
-python scrape.py --attempts 1 --keywords "QA,pytest" --min-score 2 --json
-
-# Telegram bot (Decker) — two equivalent entry points:
-python telegram_bot.py               # thin shim, delegates to bot.main
-python -m bot.main                   # canonical form
+# Telegram bot (Decker) — the only process most workflows need; two equivalent entry points:
+.venv/bin/python -m bot.main         # canonical form
+.venv/bin/python telegram_bot.py     # thin shim, delegates to bot.main
 tail -f logs/bot.log                 # watch Decker's logs (scan progress, errors, ...) live
 
-# MCP server (stdio, spawned automatically by Claude Code via .mcp.json)
-python mcp_server.py
+# Scraper REST API (optional — bot does not need this running)
+.venv/bin/python main.py             # listens on http://0.0.0.0:8000
+# Swagger UI: http://localhost:8000/docs
+
+# CLI scraper (bypasses the API, one-shot)
+.venv/bin/python scrape.py --json
+.venv/bin/python scrape.py --attempts 1 --keywords "QA,pytest" --min-score 2 --json
+
+# MCP server (stdio, spawned automatically by Claude Code via .mcp.json — never launched manually)
+.venv/bin/python mcp_server.py
 
 # Tests
 pytest -q                            # all tests (skipped automatically if cookies.json absent)
 pytest tests/test_smoke.py -v -s     # verbose with live logs
 ```
+
+> Commands above use the venv's interpreter by absolute path (`.venv/bin/python`) rather than a bare `python`. Many systems have no `python` on `PATH` at all — only `python3` — so a bare `python ...` command fails with "command not found" unless the venv is `source .venv/bin/activate`d in that *exact* shell first; that activation doesn't carry over to a separate shell invocation (a new terminal, a script, a cron job, each tool call in an automated session). `.venv/bin/python` always resolves correctly and always uses the venv's installed dependencies, so prefer it — especially for anything non-interactive. **Only run one `bot.main` instance at a time**: a second process polling the same `TELEGRAM_BOT_TOKEN` makes Telegram reject both with `Conflict: terminated by other getUpdates request` until one is killed.
 
 ## Project structure
 
